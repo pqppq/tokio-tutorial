@@ -1,28 +1,27 @@
-use futures::task;
-use std::collections::VecDeque;
+use crossbeam::channel;
+use futures::task::{self, ArcWake};
 use std::future::Future;
-use std::thread;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::thread;
 use std::time::{Duration, Instant};
 
 fn main() {
     let mut mini_tokio = MiniTokio::new();
 
-    mini_tokio.spawn(
-        async {
-            let when = Instant::now() + Duration::from_millis(10);
-            let future = Delay {when};
+    mini_tokio.spawn(async {
+        let when = Instant::now() + Duration::from_millis(10);
+        let future = Delay { when };
 
-            let out = future.await;
-            assert_eq!(out, "done");
-        }
-    )
+        let out = future.await;
+        assert_eq!(out, "done");
+    })
 }
 
 #[derive(Debug)]
 struct Delay {
-    when: Instant
+    when: Instant,
 }
 
 impl Future for Delay {
@@ -32,8 +31,7 @@ impl Future for Delay {
         if Instant::now() >= self.when {
             println!("Hello world");
             Poll::Ready("done") // represent that a value is immediately ready
-        }
-        else {
+        } else {
             let waker = cx.waker().clone();
             let when = self.when;
 
@@ -41,7 +39,7 @@ impl Future for Delay {
             thread::spawn(move || {
                 let now = Instant::now();
                 if now < when {
-                    thread::sleep(when- now);
+                    thread::sleep(when - now);
                 }
 
                 waker.wake();
@@ -53,33 +51,62 @@ impl Future for Delay {
 }
 
 struct MiniTokio {
-    tasks: VecDeque<Task>,
+    scheduled: channel::Receiver<Arc<Task>>,
+    sender: channel::Sender<Arc<Task>>,
 }
 
-type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+struct Task {
+    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    executor: channel::Sender<Arc<Task>>,
+}
+
+impl Task {
+    fn schedule(self: &Arc<Self>) {
+        self.executor.send(self.clone());
+    }
+
+    fn poll(self: Arc<Self>) {
+        let waker = task::waker(self.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let mut future = self.future.try_lock().unwrap();
+        let _ = future.as_mut().poll(&mut cx);
+    }
+
+    fn spawn<F>(future: F, sender: &channel::Sender<Arc<Task>>)
+        where F: Future<Output = ()> + Send + 'static
+    {
+        let task = Arc::new(Task {
+            future: Mutex::new(Box::pin(future)),
+            executor: sender.clone()
+        });
+
+        let _ = sender.send(task);
+    }
+}
+
+impl ArcWake for Task {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.schedule();
+    }
+}
 
 impl MiniTokio {
     fn new() -> Self {
-        Self {
-            tasks: VecDeque::new(),
-        }
+        let (sender, scheduled) = channel::unbounded();
+        Self { scheduled, sender }
     }
 
     fn spawn<F>(&mut self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.tasks.push_back(Box::pin(future));
+        Task::spawn(future, &self.sender);
     }
 
-    fn run(&mut self) {
-        let waker = task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        while let Some(mut task) = self.tasks.pop_front() {
-            if task.as_mut().poll(&mut cx).is_pending() {
-                self.tasks.push_back(task);
-            }
+    fn run(&self) {
+        while let Ok(task) = self.scheduled.recv() {
+            task.poll();
         }
     }
 }
